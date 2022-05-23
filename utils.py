@@ -7,10 +7,55 @@ import math
 from scipy.stats import kstest
 import copy
 import torch
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 
 
-def load_dataset(root, mouse=22, day=1, track='Circle', trim0=1500, trim1=100):
+TRIMS = {
+    1:{'22':[2000,10], # done 
+       '23':[60,200],  # done
+       '24':[2500,1600],# done
+       '25':[50,800]}, # done
+    2:{'22':[100,20], # done
+       '23':[10,1], # done
+       '24':[50,900], # done
+       '25':[500,800]}, # done
+    3:{'22':[100,100], # done
+       '23':[50,800], # done 
+       '24':[50,1000], # done 
+       '25':[50,600]} # done
+}
+
+def calculate_position_variables(coords):
+    
+    # x, y
+    coords -= coords.mean(0)[None,:]
+    coords_ = MinMaxScaler((-1,1)).fit_transform(coords)
+
+    # angle
+    phi = np.arctan2(coords_[:,1], coords_[:,0])
+    phi[phi < 0] = 2*np.pi + phi[phi < 0]
+    phi_ = MinMaxScaler().fit_transform(phi[:,None]).flatten()
+
+    # speed sign
+    dphi = np.diff(phi, prepend=phi[0])
+    jump_mask = np.abs(dphi) > 6 # jump through breakpoint
+    dphi[jump_mask] = -1 * np.sign(dphi[jump_mask]) * np.abs(dphi[jump_mask] - 2*np.pi)
+    circle_sign = np.sign(dphi)
+
+    # speed
+    shift = np.diff(coords_, prepend=[coords_[0]], axis=0)
+    speed = np.sqrt((shift**2).sum(1)) * circle_sign
+    speed_ = MinMaxScaler((-1,1)).fit_transform(speed[:,None]).flatten()
+
+    # acceleration
+    acceleration = np.diff(speed, prepend=speed[0])
+    acceleration_ = MinMaxScaler((0,1)).fit_transform(acceleration[:,None]).flatten()
+    
+    return coords_, phi_, speed_, acceleration_
+
+
+
+def load_dataset(root, mouse=22, day=1, track='Circle', trims=None):
 
     '''
     Loading dataset of cells activity for 
@@ -31,51 +76,34 @@ def load_dataset(root, mouse=22, day=1, track='Circle', trim0=1500, trim1=100):
     rears_events = pd.read_csv(os.path.join(root,f'CA1_22-25_rears/CA1_{mouse}_{day}D_rears_from_npz.csv'), 
                                index_col=0)
 
-    cadata = calcium_df.iloc[:,7:][trim0:-trim1].T.values # [n_neurons, T] 
-    spdata = spikes_df.iloc[:,1:][trim0:-trim1].T.values # [n_neurons, T]
+    if trims is not None:
+        trim0, trim1 = trims
+    else:
+        trim0, trim1 = 1,1
+    
+    cadata = calcium_df.iloc[:,7:][trim0:-trim1].values # [T, n_neurons]
+    spdata = spikes_df.iloc[:,1:][trim0:-trim1].values # [T, n_neurons]
     time = calcium_df['time_s'][trim0:-trim1].values # 21 FPS
     rears_events = rears_events[trim0:-trim1]
 
     rear_times = rears_events['time_s'].values
     rears_indicators = rears_events['rear_1_outward_-1_inward'].values
+    
+    # at least one spike per timeseries
+    cells_with_spikes = np.sum(spdata, axis=0) > 1.
 
-    cells_with_spikes = np.sum(spdata, axis = 1) > 1.
+    cadata = cadata[:,cells_with_spikes]
+    spdata = spdata[:,cells_with_spikes]
 
-    cadata = cadata[cells_with_spikes]
-    spdata = spdata[cells_with_spikes]
-    cadata_ = StandardScaler().fit_transform(cadata.T).T
-
-    N, T = spdata.shape
+    T,N = spdata.shape
     neurons = np.arange(N)
 
     ###########
     # TARGETS #
     ###########
     coords = calcium_df[['x','y']][trim0:-trim1].values # [T,2]
-    coords -= coords.mean(0)[None,:]
-    minmax_scaler = MinMaxScaler((-1,1))
-    coords_ = minmax_scaler.fit_transform(coords)
-    coords_normalized = coords_ / np.linalg.norm(coords_, axis=1)[:,None]
-
-    phi = np.arctan2(coords_[:,1], coords_[:,0])
-    phi[phi < 0] = 2*np.pi + phi[phi < 0]
-    phi_ = MinMaxScaler().fit_transform(phi[:,None]).flatten()
-
-    # speed sign
-    dphi = np.diff(phi, prepend=phi[0])
-    jump_mask = np.abs(dphi) > 6 # jump through breakpoint
-    dphi[jump_mask] = -1 * np.sign(dphi[jump_mask]) * np.abs(dphi[jump_mask] - 2*np.pi)
-    circle_sign = np.sign(dphi)
-
-    # speed
-    shift = np.diff(coords_, prepend=[coords_[0]], axis=0)
-    speed = np.sqrt((shift**2).sum(1)) * circle_sign
-    speed_ = MinMaxScaler((-1,1)).fit_transform(speed[:,None]).flatten()
-
-    # acceleration
-    acceleration = np.diff(speed, prepend=speed[0])
-    acceleration_ = MinMaxScaler((0,1)).fit_transform(acceleration[:,None]).flatten()
-
+    coords_, phi_, speed_, acceleration_ = calculate_position_variables(coords)
+    
     # rears indicators
     rears_indicators_abs = np.pad(np.abs(rears_indicators), pad_width=(T - rears_indicators.shape[0])//2)
 
@@ -87,7 +115,7 @@ def load_dataset(root, mouse=22, day=1, track='Circle', trim0=1500, trim1=100):
         'phi': phi_
     }
     
-    data = {'cadata': cadata_,
+    data = {'cadata': cadata,
             'spdata': spdata,
             'rears_events':rears_events,
             'rear_times':rear_times,
